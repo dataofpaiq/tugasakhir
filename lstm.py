@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""lstm_revised.py
-
-Final version with save model (.h5) and set.flow_model assignment
-"""
 
 import pandas as pd
 import numpy as np
