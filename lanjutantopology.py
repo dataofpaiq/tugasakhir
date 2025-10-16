@@ -17,3 +17,21 @@ def setupMirrorPorts():
     
     print("Mirror port 'mon0' created successfully!")
     print("Use 'mon0' interface for CICFlowMeter capture")
+
+setupMirrorPorts()
+
+    print("\n=== Network Ready ===")
+    print("Available interfaces for capture:")
+    os.system('ip link show | grep -E "s[0-9]-eth|mon0"')
+    print("\nRecommended: Use 'mon0' interface for CICFlowMeter")
+    print("Example: sudo python3 -m cicflowmeter.sniffer -i mon0 -o /path/to/output\n")
+    
+    print("Jalankan CLI Mininet. Coba periksa ping antar host dan topologi di ONOS.")
+    CLI(net)
+
+    # Cleanup
+    print("Cleaning up mirror ports...")
+    os.system('sudo ovs-vsctl clear Bridge s2 mirrors')
+    os.system('sudo ovs-vsctl del-port s2 mon0')
+    os.system('sudo ip link delete mon0')
+
