@@ -2,8 +2,8 @@
 """
 sim_traffic.py
 
-Script Mininet untuk simulasi "normal traffic" dengan xterm per-host.
-Topologi disesuaikan dengan yang kamu berikan.
+Mininet script: buka xterm per-host dengan TITLE = nama host (h1, h3, h4, ...)
+Simulasi trafik normal (HTTP download loops + ICMP pings).
 Jalankan:
     sudo python3 sim_traffic.py
 """
@@ -65,22 +65,21 @@ def startNetwork():
     h7 = net.get('h7')
 
     info('*** Membuat file sample di server (h4, h7)\n')
-    # Pastikan direktori /tmp ada dan buat file ukuran berbeda
+    # Pastikan direktori /tmp/www ada dan buat file ukuran berbeda
     h4.cmd('mkdir -p /tmp/www')
     h7.cmd('mkdir -p /tmp/www')
-    # create files 1MB, 5MB, 10MB
     h4.cmd('dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1 >/dev/null 2>&1 || true')
     h4.cmd('dd if=/dev/zero of=/tmp/www/file5M.bin bs=1M count=5 >/dev/null 2>&1 || true')
     h7.cmd('dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1 >/dev/null 2>&1 || true')
     h7.cmd('dd if=/dev/zero of=/tmp/www/file10M.bin bs=1M count=10 >/dev/null 2>&1 || true')
 
-    info('*** Menjalankan HTTP server di h4 dan h7 (di xterm)\n')
-    # open xterm yang menjalankan http.server di background (menampilkan logs)
-    makeTerm(h4, 'bash -ic "cd /tmp/www && python3 -m http.server 80 2>&1 | tee /tmp/h4_http.log; exec bash"')
-    makeTerm(h7, 'bash -ic "cd /tmp/www && python3 -m http.server 80 2>&1 | tee /tmp/h7_http.log; exec bash"')
+    info('*** Menjalankan HTTP server di h4 dan h7 (xterm dengan title host)\n')
+    # gunakan title = host.name agar xterm mudah dikenali
+    makeTerm(h4, cmd='bash -ic "cd /tmp/www && python3 -m http.server 80 2>&1 | tee /tmp/h4_http.log"', title=h4.name)
+    makeTerm(h7, cmd='bash -ic "cd /tmp/www && python3 -m http.server 80 2>&1 | tee /tmp/h7_http.log"', title=h7.name)
     time.sleep(1)
 
-    info('*** Men-start traffic generators di xterm untuk clients (h1,h5)\n')
+    info('*** Men-start traffic generators di xterm untuk clients (h1,h5) dengan TITLE host\n')
     # h1: loop wget ke h4 (file1M + file5M) bergantian
     cmd_h1 = (
         'bash -ic "'
@@ -88,9 +87,8 @@ def startNetwork():
         'echo \"[h1] wget file1M from h4\"; wget -q -O /dev/null http://10.0.0.4/file1M.bin; sleep 0.5; '
         'echo \"[h1] wget file5M from h4\"; wget -q -O /dev/null http://10.0.0.4/file5M.bin; sleep 1; '
         'done"'
-        ' ; exec bash'
     )
-    makeTerm(h1, cmd_h1)
+    makeTerm(h1, cmd=cmd_h1, title=h1.name)
 
     # h5: loop wget ke h7 (file1M + file10M)
     cmd_h5 = (
@@ -99,19 +97,14 @@ def startNetwork():
         'echo \"[h5] wget file1M from h7\"; wget -q -O /dev/null http://10.0.0.7/file1M.bin; sleep 0.6; '
         'echo \"[h5] wget file10M from h7\"; wget -q -O /dev/null http://10.0.0.7/file10M.bin; sleep 2; '
         'done"'
-        ' ; exec bash'
     )
-    makeTerm(h5, cmd_h5)
+    makeTerm(h5, cmd=cmd_h5, title=h5.name)
 
-    info('*** Menjalankan ping background di beberapa host untuk ICMP traffic (xterm)\n')
-    makeTerm(h3, 'bash -ic "while true; do ping -c1 10.0.0.4; sleep 1; done; exec bash"')  # attacker (benign ping)
-    makeTerm(h6, 'bash -ic "while true; do ping -c1 10.0.0.7; sleep 1; done; exec bash"')  # attacker (benign ping)
+    info('*** Menjalankan ping background di beberapa host untuk ICMP traffic (xterm dengan title host)\n')
+    makeTerm(h3, cmd='bash -ic "while true; do ping -c1 10.0.0.4; sleep 1; done"', title=h3.name)
+    makeTerm(h6, cmd='bash -ic "while true; do ping -c1 10.0.0.7; sleep 1; done"', title=h6.name)
 
-    # Optional: jalankan iperf server/client contoh (uncomment jika mau)
-    # h4.cmd('iperf3 -s &')
-    # h1.cmd('iperf3 -c 10.0.0.4 -t 100 &')
-
-    info('*** Semua xterm terbuka. Masuk ke Mininet CLI untuk kontrol manual.\n')
+    info('*** Semua xterm terbuka (title = nama host). Masuk ke Mininet CLI untuk kontrol manual.\n')
     info(' - Lihat log http server: /tmp/h4_http.log di h4 xterm, /tmp/h7_http.log di h7 xterm\n')
     info(' - Jika mau hentikan simulasi, tutup xterm atau gunakan Mininet CLI "exit" lalu net.stop()\n')
 
