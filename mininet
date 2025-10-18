@@ -1,0 +1,49 @@
+# buat direktori www & file sampel pada server hosts
+h4 mkdir -p /tmp/www
+h4 dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1
+h4 dd if=/dev/zero of=/tmp/www/file5M.bin bs=1M count=5
+
+h7 mkdir -p /tmp/www
+h7 dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1
+h7 dd if=/dev/zero of=/tmp/www/file10M.bin bs=1M count=10
+
+# start http servers (background)
+h4 python3 -m http.server 80 > /tmp/h4_http.log 2>&1 &
+h7 python3 -m http.server 80 > /tmp/h7_http.log 2>&1 &
+
+# buat script client dan jalankan (example)
+h1 bash -c 'cat > /tmp/send_http_client.sh <<'"'"'SH'"'"'
+#!/bin/sh
+URL="http://10.0.0.4/file1M.bin"
+SLEEP=0.7
+i=0
+while :
+do
+  i=$((i+1))
+  echo "[h1] iter $i fetching $URL" >> /tmp/h1_generate.log 2>&1
+  wget -q -O /dev/null "$URL"
+  sleep $SLEEP
+done
+SH
+chmod +x /tmp/send_http_client.sh
+h1 /tmp/send_http_client.sh &
+
+h5 bash -c 'cat > /tmp/send_http_client.sh <<'"'"'SH'"'"'
+#!/bin/sh
+URL="http://10.0.0.7/file10M.bin"
+SLEEP=2
+i=0
+while :
+do
+  i=$((i+1))
+  echo "[h5] iter $i fetching $URL" >> /tmp/h5_generate.log 2>&1
+  wget -q -O /dev/null "$URL"
+  sleep $SLEEP
+done
+SH
+chmod +x /tmp/send_http_client.sh
+h5 /tmp/send_http_client.sh &
+
+# start ping loops
+h3 bash -c 'while true; do ping -c1 10.0.0.4 >/dev/null 2>&1; echo "[h3] ping" >> /tmp/h3_generate.log; sleep 1; done' &
+h6 bash -c 'while true; do ping -c1 10.0.0.7 >/dev/null 2>&1; echo "[h6] ping" >> /tmp/h6_generate.log; sleep 1; done' &
