@@ -1,162 +1,310 @@
 #!/usr/bin/env python3
 """
-sim_traffic_manual_v2.py
+generate_traffic.py (updated)
 
-- Run this manually inside an xterm (do NOT let script open xterms automatically).
-- It creates the topology, creates sample files and helper *shell* scripts in /tmp on each host.
-- It does NOT auto-run traffic. You must start servers/clients manually from Mininet CLI or an xterm.
+Features:
+ - start HTTP servers on h4,h7 and clients (h1,h5) + ping loops (h3,h6) in Mininet hosts
+ - default mode (run on host OS) uses mnexec to execute per-host commands
+ - --auto-stop <seconds> : automatically stop background jobs after N seconds
+ - --write-mininet-cmds <file> : write a list of Mininet-CLI commands (hX ...) you can paste
+   into the Mininet CLI to start the traffic there (alternative to host-mode)
+ - logs are written to /tmp/<host>_*.log inside Mininet hosts
 
-Usage:
-    sudo python3 sim_traffic_manual_v2.py
+Usage (host OS terminal):
+  sudo python3 generate_traffic.py
+  sudo python3 generate_traffic.py --auto-stop 60
+  sudo python3 generate_traffic.py --write-mininet-cmds start.cmds
+
+Notes:
+ - This script assumes your Mininet topology is already running and hosts have names h1,h3,h4,h5,h6,h7.
+ - If host names differ, edit the HOST lists (SERVERS/CLIENTS/PINGS) accordingly.
 """
-from mininet.net import Mininet
-from mininet.topo import Topo
-from mininet.node import RemoteController, OVSKernelSwitch
-from mininet.link import TCLink
-from mininet.cli import CLI
-from mininet.log import setLogLevel, info
-import time
 
-class MyTopo(Topo):
-    def build(self):
-        s1 = self.addSwitch('s1', cls=OVSKernelSwitch, protocols='OpenFlow13')
-        s2 = self.addSwitch('s2', cls=OVSKernelSwitch, protocols='OpenFlow13')
-        s3 = self.addSwitch('s3', cls=OVSKernelSwitch, protocols='OpenFlow13')
+import subprocess, shlex, time, sys, os, argparse
 
-        h1 = self.addHost('h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01')
-        h3 = self.addHost('h3', ip='10.0.0.3/24', mac='00:00:00:00:00:03')  # attacker (idle)
-        h4 = self.addHost('h4', ip='10.0.0.4/24', mac='00:00:00:00:00:04')  # server
-        h5 = self.addHost('h5', ip='10.0.0.5/24', mac='00:00:00:00:00:05')
-        h6 = self.addHost('h6', ip='10.0.0.6/24', mac='00:00:00:00:00:06')  # attacker (idle)
-        h7 = self.addHost('h7', ip='10.0.0.7/24', mac='00:00:00:00:00:07')  # server
+# ------------------------------------------------------------------------------
+# Configuration: edit if your host names or IPs differ
+# ------------------------------------------------------------------------------
+SERVERS = {
+    "h4": {
+        "www_dir": "/tmp/www",
+        "files": [("file1M.bin", 1), ("file5M.bin", 5)],
+        "start_cmd": "cd /tmp/www && nohup python3 -m http.server 80 > /tmp/h4_http.log 2>&1 &"
+    },
+    "h7": {
+        "www_dir": "/tmp/www",
+        "files": [("file1M.bin", 1), ("file10M.bin", 10)],
+        "start_cmd": "cd /tmp/www && nohup python3 -m http.server 80 > /tmp/h7_http.log 2>&1 &"
+    },
+}
 
-        # connect hosts to switches
-        self.addLink(h1, s1)
-        self.addLink(h3, s2)
-        self.addLink(h4, s2)
-        self.addLink(h5, s2)
-        self.addLink(h6, s3)
-        self.addLink(h7, s3)
+CLIENTS = {
+    # host: (url, sleep_seconds, iterations(0=infinite))
+    "h1": ("http://10.0.0.4/file1M.bin", 0.7, 0),
+    "h5": ("http://10.0.0.7/file10M.bin", 2.0, 0),
+}
 
-        # inter-switch links
-        self.addLink(s1, s2)
-        self.addLink(s2, s3)
+PINGS = {
+    "h3": ("10.0.0.4", 1.0, 0),
+    "h6": ("10.0.0.7", 1.0, 0),
+}
 
+# Names of the client/ping scripts inside hosts for pkill/cleanup
+CLIENT_SCRIPT_NAME = "/tmp/send_http_client.sh"
+PING_SCRIPT_NAME = "/tmp/ping_loop.sh"
 
-def write_shell_helpers(host):
-    """
-    Create POSIX shell helpers under /tmp on the given Mininet host.
+# ------------------------------------------------------------------------------
+# Helpers for running shell commands on the host OS
+# ------------------------------------------------------------------------------
+def run_local(cmd):
+    """Run command in host OS shell. Return (rc, stdout, stderr)."""
+    try:
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = p.communicate()
+        return p.returncode, out.decode(errors='ignore'), err.decode(errors='ignore')
+    except Exception as e:
+        return 1, "", str(e)
 
-    - /tmp/send_http_client.sh <url> <sleep_s> [count]
-      uses wget to fetch URL repeatedly (quiet), sleeps between iterations.
-    - /tmp/ping_loop.sh <dest_ip> <interval_s> [count]
-      runs 'ping -c 1' in a loop.
+def find_host_pid(hostname):
+    """Return the PID for the Mininet host process 'mininet: <hostname>' (first match) or None."""
+    rc, out, err = run_local(f"pgrep -f 'mininet: {hostname}'")
+    if rc != 0 or not out.strip():
+        return None
+    return out.strip().splitlines()[0].strip()
 
-    These are plain shell scripts (no Python heredoc), safe for pingall and shell parsing.
-    """
-    send_http = r"""#!/bin/sh
-# send_http_client.sh <url> <sleep_s> [count]
-if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <url> <sleep_seconds> [count]"
-  exit 1
-fi
-URL="$1"
-SLEEP="$2"
-COUNT=0
-if [ "$#" -ge 3 ]; then
-  COUNT="$3"
-fi
+def mnexec_run(pid, cmdline):
+    """Execute a command inside Mininet host namespace using mnexec -a <pid> -- sh -c '<cmdline>'.
+       Returns (rc, out, err)."""
+    full = f"sudo mnexec -a {pid} -- sh -c {shlex.quote(cmdline)}"
+    return run_local(full)
+
+# ------------------------------------------------------------------------------
+# Construct mininet-CLI commands (text) so user can paste them into Mininet prompt
+# ------------------------------------------------------------------------------
+def build_mininet_commands():
+    """Return lines (list of str) of Mininet CLI commands to start servers/clients/pings."""
+    lines = []
+    # server start commands
+    for h, conf in SERVERS.items():
+        # create files
+        lines.append(f"{h} mkdir -p {conf['www_dir']}")
+        for fname, mb in conf['files']:
+            lines.append(f"{h} dd if=/dev/zero of={conf['www_dir']}/{fname} bs=1M count={mb}")
+        # start http server
+        lines.append(f"{h} python3 -m http.server 80 > /tmp/{h}_http.log 2>&1 &")
+    # client commands
+    for host, (url, sleep_s, iters) in CLIENTS.items():
+        lines.append(f"{host} {CLIENT_SCRIPT_NAME} \"{url}\" {sleep_s} {iters} &")
+    # ping scripts
+    for host, (dest, interval, iters) in PINGS.items():
+        lines.append(f"{host} {PING_SCRIPT_NAME} {dest} {interval} {iters} &")
+    # convenience: logfile tails
+    lines.append("# tail logs examples: h1 tail -f /tmp/h1_client.log")
+    return lines
+
+# ------------------------------------------------------------------------------
+# Functions to install and start jobs via mnexec
+# ------------------------------------------------------------------------------
+def ensure_server_files(pid, server_conf, host):
+    cmds = [f"mkdir -p {server_conf['www_dir']}"]
+    for fname, mb in server_conf['files']:
+        cmds.append(f"dd if=/dev/zero of={server_conf['www_dir']}/{fname} bs=1M count={mb} >/dev/null 2>&1 || true")
+    rc, out, err = mnexec_run(pid, " && ".join(cmds))
+    return rc == 0
+
+def start_server(pid, server_conf, host):
+    rc, out, err = mnexec_run(pid, server_conf['start_cmd'])
+    return rc == 0
+
+def start_client(pid, url, sleep_s, iterations, host):
+    # write script to /tmp/send_http_client.sh inside host and run it
+    script = f"""cat > {CLIENT_SCRIPT_NAME} <<'SH'
+#!/bin/sh
+URL="{url}"
+SLEEP="{sleep_s}"
+COUNT={int(iterations)}
 i=0
 while :
 do
-  i=$((i + 1))
-  echo "[send_http_client] iter $i fetching $URL"
+  i=$((i+1))
+  echo "[send_http_client] iter $i fetching $URL" >> /tmp/{host}_generate.log 2>&1
   wget -q -O /dev/null "$URL"
   if [ "$COUNT" -ne 0 ] && [ "$i" -ge "$COUNT" ]; then
     break
   fi
   sleep "$SLEEP"
 done
+SH
+chmod +x {CLIENT_SCRIPT_NAME}
+nohup {CLIENT_SCRIPT_NAME} > /tmp/{host}_client.log 2>&1 &
 """
+    return mnexec_run(pid, script)
 
-    ping_loop = r"""#!/bin/sh
-# ping_loop.sh <dest_ip> <interval_s> [count]
-if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <dest_ip> <interval_seconds> [count]"
-  exit 1
-fi
-DEST="$1"
-INTERVAL="$2"
-COUNT=0
-if [ "$#" -ge 3 ]; then
-  COUNT="$3"
-fi
+def start_ping_loop(pid, dest, interval, iterations, host):
+    script = f"""cat > {PING_SCRIPT_NAME} <<'SH'
+#!/bin/sh
+DEST="{dest}"
+INTERVAL="{interval}"
+COUNT={int(iterations)}
 i=0
 while :
 do
-  i=$((i + 1))
-  echo "[ping_loop] iter $i -> $DEST"
-  ping -c 1 "$DEST"
+  i=$((i+1))
+  echo "[ping_loop] iter $i -> $DEST" >> /tmp/{host}_generate.log 2>&1
+  ping -c 1 "$DEST" >/dev/null 2>&1
   if [ "$COUNT" -ne 0 ] && [ "$i" -ge "$COUNT" ]; then
     break
   fi
   sleep "$INTERVAL"
 done
+SH
+chmod +x {PING_SCRIPT_NAME}
+nohup {PING_SCRIPT_NAME} > /tmp/{host}_ping.log 2>&1 &
 """
+    return mnexec_run(pid, script)
 
-    # write to host /tmp
-    host.cmd('mkdir -p /tmp')
-    # use a safe redirect to write the content
-    host.cmd('bash -c "cat > /tmp/send_http_client.sh <<\'SH\'\n' + send_http + '\nSH\n"')
-    host.cmd('bash -c "cat > /tmp/ping_loop.sh <<\'SH\'\n' + ping_loop + '\nSH\n"')
-    host.cmd('chmod +x /tmp/send_http_client.sh /tmp/ping_loop.sh')
+# ------------------------------------------------------------------------------
+# Stop / cleanup functions (pkill inside host namespaces)
+# ------------------------------------------------------------------------------
+def stop_clients(pid, host):
+    # tries to pkill client script and client loggers
+    return mnexec_run(pid, f"pkill -f {os.path.basename(CLIENT_SCRIPT_NAME)} || true; pkill -f wget || true; rm -f /tmp/{host}_client.log || true")
 
+def stop_pings(pid, host):
+    return mnexec_run(pid, f"pkill -f {os.path.basename(PING_SCRIPT_NAME)} || true; rm -f /tmp/{host}_ping.log || true")
 
-def startNetwork():
-    setLogLevel('info')
-    topo = MyTopo()
-    c0 = RemoteController('c0', ip='127.0.0.1', port=6653)
-    net = Mininet(topo=topo, controller=c0, link=TCLink, autoSetMacs=True)
+def stop_servers(pid, host):
+    # stop python http.server processes and remove logs optionally
+    return mnexec_run(pid, f"pkill -f http.server || true; rm -f /tmp/{host}_http.log || true")
 
-    info('*** Starting network\n')
-    net.start()
-    time.sleep(1)
+# ------------------------------------------------------------------------------
+# Main flow
+# ------------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Generate traffic inside existing Mininet topology")
+    p.add_argument("--auto-stop", type=int, default=0, metavar="SECONDS",
+                   help="Automatically stop all generated background jobs after SECONDS (0=never).")
+    p.add_argument("--write-mininet-cmds", type=str, default="", metavar="FILE",
+                   help="Write Mininet CLI commands to FILE so you can paste them into mininet> prompt.")
+    p.add_argument("--no-start", action="store_true",
+                   help="Do not start anything; only write mininet cmds (if --write-mininet-cmds provided).")
+    return p.parse_args()
 
-    # get host objects
-    hosts = { name: net.get(name) for name in ('h1','h3','h4','h5','h6','h7') }
+def main():
+    args = parse_args()
+    if os.geteuid() != 0:
+        print("Please run as root (sudo).")
+        sys.exit(1)
 
-    info('*** Creating sample files on servers (h4,h7) under /tmp/www\n')
-    hosts['h4'].cmd('mkdir -p /tmp/www')
-    hosts['h7'].cmd('mkdir -p /tmp/www')
-    hosts['h4'].cmd('dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1 >/dev/null 2>&1 || true')
-    hosts['h4'].cmd('dd if=/dev/zero of=/tmp/www/file5M.bin bs=1M count=5 >/dev/null 2>&1 || true')
-    hosts['h7'].cmd('dd if=/dev/zero of=/tmp/www/file1M.bin bs=1M count=1 >/dev/null 2>&1 || true')
-    hosts['h7'].cmd('dd if=/dev/zero of=/tmp/www/file10M.bin bs=1M count=10 >/dev/null 2>&1 || true')
+    all_hosts = set(list(SERVERS.keys()) + list(CLIENTS.keys()) + list(PINGS.keys()))
 
-    info('*** Installing POSIX shell helper scripts on hosts (in /tmp). They are NOT started automatically.\n')
-    for h in hosts.values():
-        write_shell_helpers(h)
+    # Optionally write mininet commands and exit (or continue)
+    if args.write_mininet_cmds := args.write_mininet_cmds if hasattr(args, 'write_mininet_cmds') else args.write_mininet_cmds:
+        if args.write_mininet_cmds:
+            lines = build_mininet_commands()
+            with open(args.write_mininet_cmds, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            print(f"Wrote Mininet CLI commands to {args.write_mininet_cmds}.")
+            print("You can paste the file contents into mininet> prompt or open the file for reference.")
+            if args.no_start:
+                return
 
-    info('*** Setup finished. IMPORTANT: This script does NOT open xterms or auto-run traffic.\n')
-    info('Manual commands you can run from the mininet> prompt or in an xterm (open xterm manually):\n')
-    info('  # Start HTTP servers in background (on server hosts):\n')
-    info('    h4 python3 -m http.server 80 &\n')
-    info('    h7 python3 -m http.server 80 &\n')
-    info('  # Run HTTP client loops (manual):\n')
-    info('    h1 /tmp/send_http_client.sh http://10.0.0.4/file1M.bin 0.5 &\n')
-    info('    h5 /tmp/send_http_client.sh http://10.0.0.7/file10M.bin 2 &\n')
-    info('  # Run ping loops (manual):\n')
-    info('    h3 /tmp/ping_loop.sh 10.0.0.4 1 &\n')
-    info('    h6 /tmp/ping_loop.sh 10.0.0.7 1 &\n')
-    info('  # To stop a background job in a host, use: pkill -f send_http_client.sh (or ping_loop.sh) on that host.\n')
-    info('\n')
-    info('*** Now entering Mininet CLI in this xterm. Run manual commands above when ready.\n')
+    print("Locating Mininet host PIDs...")
+    host_pids = {}
+    for h in sorted(all_hosts):
+        pid = find_host_pid(h)
+        if not pid:
+            print(f"Warning: host '{h}' pid not found (is topology running and host named '{h}' present?)")
+        else:
+            host_pids[h] = pid
+            print(f"Found {h} -> pid {pid}")
 
-    CLI(net)
+    if args.no_start:
+        print("No-start flag set; exiting after writing commands (if any).")
+        return
 
-    info('*** Stopping network and cleanup...\n')
-    net.stop()
+    # Start servers
+    for host, conf in SERVERS.items():
+        pid = host_pids.get(host)
+        if not pid:
+            print(f"Skipping server {host}: pid not found.")
+            continue
+        print(f"Preparing server files on {host}...")
+        ok = ensure_server_files(pid, conf, host)
+        print("  files ok" if ok else "  files failed")
+        print(f"Starting http server on {host}...")
+        ok = start_server(pid, conf, host)
+        print("  started" if ok else "  failed")
 
+    time.sleep(1.2)  # give servers a moment
+
+    # Start clients
+    for host, (url, sleep_s, iters) in CLIENTS.items():
+        pid = host_pids.get(host)
+        if not pid:
+            print(f"Skipping client {host}: pid not found.")
+            continue
+        print(f"Starting client loop on {host} -> {url} sleep={sleep_s}s iters={iters or 'inf'}")
+        rc, out, err = start_client(pid, url, sleep_s, iters, host)
+        if rc == 0:
+            print("  client started")
+        else:
+            print("  client failed:", err.strip() or out.strip())
+
+    # Start ping loops
+    for host, (dest, interval, iters) in PINGS.items():
+        pid = host_pids.get(host)
+        if not pid:
+            print(f"Skipping ping {host}: pid not found.")
+            continue
+        print(f"Starting ping loop on {host} -> {dest}")
+        rc, out, err = start_ping_loop(pid, dest, interval, iters, host)
+        if rc == 0:
+            print("  ping started")
+        else:
+            print("  ping failed:", err.strip() or out.strip())
+
+    # If auto-stop requested, wait then stop
+    if args.auto_stop and args.auto_stop > 0:
+        print(f"\nAuto-stop is active: the script will stop generated jobs after {args.auto_stop} seconds.")
+        try:
+            time.sleep(args.auto_stop)
+            print("Auto-stop timeout reached — stopping clients/pings/servers...")
+            # stop clients/pings/servers
+            for host in sorted(all_hosts):
+                pid = host_pids.get(host)
+                if not pid:
+                    continue
+                print(f"Stopping clients on {host}...")
+                stop_clients(pid, host)
+                print(f"Stopping pings on {host}...")
+                stop_pings(pid, host)
+                if host in SERVERS:
+                    print(f"Stopping server on {host}...")
+                    stop_servers(pid, host)
+            print("Auto-stop cleanup complete.")
+        except KeyboardInterrupt:
+            print("Auto-stop interrupted by user; leaving background jobs running.")
+
+    else:
+        print("\nTraffic generators started. (No auto-stop scheduled.)")
+
+    print("\nPer-host logs inside Mininet hosts:")
+    for host in sorted(all_hosts):
+        print(f"  mininet> {host} tail -n 40 /tmp/{host}_generate.log  (or /tmp/{host}_client.log /tmp/{host}_ping.log)")
+
+    print("\nTo stop manually (from host OS): use mnexec or from mininet> use pkill on each host, e.g.:")
+    print("  mininet> h1 pkill -f send_http_client.sh")
+    print("  mininet> h4 pkill -f http.server")
+    print("  mininet> h3 pkill -f ping_loop.sh")
+
+    # remain alive until user Ctrl-C (if desired)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nExiting main script. Note: background jobs inside Mininet hosts may still run until killed.")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    startNetwork()
+    main()
